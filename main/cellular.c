@@ -8,8 +8,8 @@
 
 /* ── Hardware ────────────────────────────────────────────────────────────── */
 #define CELL_UART_PORT      UART_NUM_1
-#define CELL_UART_TX        GPIO_NUM_17
-#define CELL_UART_RX        GPIO_NUM_18
+#define CELL_UART_TX        17
+#define CELL_UART_RX        18
 #define CELL_UART_BAUD      115200
 #define CELL_UART_BUF_SIZE  2048
 

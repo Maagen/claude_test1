@@ -43,7 +43,7 @@ static bool IRAM_ATTR on_rx_done(twai_node_handle_t handle, const twai_rx_done_e
 /* Called from ISR on state transitions — signals the recovery task on bus-off */
 static bool IRAM_ATTR on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
 {
-    if (edata->new_state == TWAI_STATE_BUS_OFF) {
+    if (edata->new_sta == TWAI_ERROR_BUS_OFF) {
         BaseType_t woken = pdFALSE;
         xSemaphoreGiveFromISR(s_busoff_sem, &woken);
         return woken == pdTRUE;
