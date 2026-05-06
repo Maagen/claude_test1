@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
@@ -19,6 +20,7 @@ static const char *TAG = "CAN";
 static twai_node_handle_t s_node;
 static QueueHandle_t      s_tx_queue;
 static QueueHandle_t      s_rx_queue;
+static SemaphoreHandle_t  s_busoff_sem;
 
 /* Called from ISR when a frame arrives — reads it and posts to the RX queue */
 static bool IRAM_ATTR on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
@@ -34,8 +36,19 @@ static bool IRAM_ATTR on_rx_done(twai_node_handle_t handle, const twai_rx_done_e
     memcpy(msg.data, buf, msg.dlc <= 8 ? msg.dlc : 8);
 
     BaseType_t woken = pdFALSE;
-    xQueueSendFromISR((QueueHandle_t)user_ctx, &msg, &woken);
+    xQueueSendFromISR(s_rx_queue, &msg, &woken);
     return woken == pdTRUE;
+}
+
+/* Called from ISR on state transitions — signals the recovery task on bus-off */
+static bool IRAM_ATTR on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
+{
+    if (edata->new_state == TWAI_STATE_BUS_OFF) {
+        BaseType_t woken = pdFALSE;
+        xSemaphoreGiveFromISR(s_busoff_sem, &woken);
+        return woken == pdTRUE;
+    }
+    return false;
 }
 
 /* Dequeues messages and transmits them on the CAN bus */
@@ -78,6 +91,22 @@ static void can_rx_task(void *arg)
     }
 }
 
+/* Waits for a bus-off signal and recovers by cycling the node */
+static void can_busoff_task(void *arg)
+{
+    while (1) {
+        xSemaphoreTake(s_busoff_sem, portMAX_DELAY);
+        ESP_LOGW(TAG, "Bus-off detected, reinitializing...");
+        twai_node_disable(s_node);
+        esp_err_t ret = twai_node_enable(s_node);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "CAN recovered from bus-off");
+        } else {
+            ESP_LOGE(TAG, "Bus-off recovery failed: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
 esp_err_t CAN_init(void)
 {
     twai_onchip_node_config_t node_cfg = {
@@ -89,17 +118,22 @@ esp_err_t CAN_init(void)
         },
         .bit_timing     = { .bitrate = CAN_BITRATE },
         .tx_queue_depth = CAN_TX_QUEUE_LEN,
+        .flags          = { .enable_self_test = 1 },  // TX succeeds without ACK from another node
     };
 
     esp_err_t ret = twai_new_node_onchip(&node_cfg, &s_node);
     if (ret != ESP_OK) return ret;
 
-    s_rx_queue = xQueueCreate(CAN_RX_QUEUE_LEN, sizeof(can_msg_t));
-    s_tx_queue = xQueueCreate(CAN_TX_QUEUE_LEN, sizeof(can_msg_t));
-    if (!s_rx_queue || !s_tx_queue) return ESP_ERR_NO_MEM;
+    s_rx_queue  = xQueueCreate(CAN_RX_QUEUE_LEN, sizeof(can_msg_t));
+    s_tx_queue  = xQueueCreate(CAN_TX_QUEUE_LEN, sizeof(can_msg_t));
+    s_busoff_sem = xSemaphoreCreateBinary();
+    if (!s_rx_queue || !s_tx_queue || !s_busoff_sem) return ESP_ERR_NO_MEM;
 
-    twai_event_callbacks_t cbs = { .on_rx_done = on_rx_done };
-    ret = twai_node_register_event_callbacks(s_node, &cbs, s_rx_queue);
+    twai_event_callbacks_t cbs = {
+        .on_rx_done     = on_rx_done,
+        .on_state_change = on_state_change,
+    };
+    ret = twai_node_register_event_callbacks(s_node, &cbs, NULL);
     if (ret != ESP_OK) return ret;
 
     twai_mask_filter_config_t f_cfg = { .id = 0, .mask = 0, .is_ext = false };
@@ -112,8 +146,9 @@ esp_err_t CAN_init(void)
     ESP_LOGI(TAG, "Started  TX=GPIO%d  RX=GPIO%d  %u kbps",
              CAN_TX_GPIO, CAN_RX_GPIO, CAN_BITRATE / 1000);
 
-    xTaskCreate(can_tx_task, "can_tx", 4096, NULL, 5, NULL);
-    xTaskCreate(can_rx_task, "can_rx", 4096, NULL, 5, NULL);
+    xTaskCreate(can_tx_task,     "can_tx",     4096, NULL, 5, NULL);
+    xTaskCreate(can_rx_task,     "can_rx",     4096, NULL, 5, NULL);
+    xTaskCreate(can_busoff_task, "can_busoff", 2048, NULL, 6, NULL);
 
     return ESP_OK;
 }
